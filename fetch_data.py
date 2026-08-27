@@ -3,6 +3,22 @@
 
 Uses the FREE /news endpoint's `category` field as the topic label, building a
 CSV dataset of (text, label) pairs suitable for fine-tuning a BERT classifier.
+
+Everything here works on a brand-new free NewsData.io key: only the `/news`
+endpoint and its free parameters (`category`, `language`, `country`, `page`)
+are used. No paid-only fields (sentiment, ai_tag, /archive) are required.
+
+Examples:
+    export NEWSDATA_API_KEY=your_key_here
+
+    # default: 1 page per category, English, worldwide
+    python fetch_data.py
+
+    # 3 pages per category, US-only articles
+    python fetch_data.py --pages 3 --country us
+
+    # a couple of countries, just two categories
+    python fetch_data.py --country us,gb --categories sports technology
 """
 import argparse
 import csv
@@ -29,6 +45,10 @@ CATEGORIES = [
     "world",
 ]
 
+# NewsData.io accepts a small number of comma-separated country codes per call
+# on the free tier. Keep the list short to avoid a 422 from the API.
+MAX_COUNTRIES = 5
+
 
 def get_api_key():
     key = os.environ.get("NEWSDATA_API_KEY")
@@ -41,11 +61,63 @@ def get_api_key():
     return key
 
 
-def fetch_category(api_key, category, pages, language, country, sleep):
-    """Fetch up to `pages` pages of articles for one category."""
+def normalize_country(raw):
+    """Normalize a --country value into the string the API expects.
+
+    Accepts a single code ("us") or a comma-separated list ("us, gb").
+    Returns None when no country filter was requested, meaning the API
+    returns worldwide results (the default free-tier behaviour).
+    """
+    if not raw:
+        return None
+    codes = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    if not codes:
+        return None
+    for code in codes:
+        if not code.isalpha() or len(code) != 2:
+            sys.exit(
+                f"ERROR: invalid country code {code!r}. Use 2-letter ISO codes, "
+                "e.g. --country us or --country us,gb"
+            )
+    if len(codes) > MAX_COUNTRIES:
+        sys.exit(
+            f"ERROR: at most {MAX_COUNTRIES} country codes are supported "
+            "(free-tier limit)."
+        )
+    return ",".join(codes)
+
+
+def build_text(article, include_description=True):
+    """Turn one API result into a single training string."""
+    title = (article.get("title") or "").strip()
+    if not title or title.lower() in {"none", "null"}:
+        return ""
+    if not include_description:
+        return title
+    description = (article.get("description") or "").strip()
+    if description and description.lower() not in {"none", "null"}:
+        return f"{title}. {description}"
+    return title
+
+
+def fetch_category(
+    api_key,
+    category,
+    pages,
+    language,
+    country=None,
+    include_description=True,
+    sleep=1.0,
+):
+    """Fetch up to `pages` pages of articles for one category.
+
+    `country` is optional; when given it is passed straight through to the
+    NewsData.io `country` parameter so the dataset is geographically targeted.
+    """
     rows = []
     next_page = None
-    for page_num in range(pages):
+
+    for page_num in range(1, pages + 1):
         params = {
             "apikey": api_key,
             "category": category,
@@ -59,110 +131,171 @@ def fetch_category(api_key, category, pages, language, country, sleep):
         try:
             resp = requests.get(API_URL, params=params, timeout=30)
         except requests.RequestException as exc:
-            print(f"  [{category}] network error: {exc}")
+            print(f"  ! network error on page {page_num}: {exc}")
             break
 
-        if resp.status_code == 401:
-            sys.exit("ERROR: Invalid API key (401). Check NEWSDATA_API_KEY.")
         if resp.status_code == 429:
-            print(f"  [{category}] rate limited (429); waiting 15s ...")
-            time.sleep(15)
-            continue
-        if resp.status_code in (403, 422):
-            print(
-                f"  [{category}] request rejected ({resp.status_code}); "
-                "skipping (likely a free-plan limitation)."
-            )
+            print("  ! rate limited by NewsData.io (free tier) - stopping here.")
             break
+
         if resp.status_code != 200:
-            print(f"  [{category}] unexpected status {resp.status_code}; stopping.")
+            message = ""
+            try:
+                body = resp.json()
+                message = (body.get("results") or {}).get("message") or body.get(
+                    "message", ""
+                )
+            except ValueError:
+                message = resp.text[:200]
+            print(f"  ! HTTP {resp.status_code} on page {page_num}: {message}")
             break
 
         try:
             payload = resp.json()
         except ValueError:
-            print(f"  [{category}] could not parse response; stopping.")
+            print(f"  ! could not decode JSON on page {page_num}")
+            break
+
+        if payload.get("status") != "success":
+            print(f"  ! API returned status={payload.get('status')}")
             break
 
         results = payload.get("results") or []
-        if not results:
-            print(f"  [{category}] no more results.")
-            break
+        for article in results:
+            text = build_text(article, include_description=include_description)
+            if text:
+                rows.append((text, category))
 
-        for art in results:
-            title = (art.get("title") or "").strip()
-            desc = (art.get("description") or "").strip()
-            text = (title + ". " + desc).strip(". ").strip()
-            if len(text) < 20:
-                continue
-            rows.append({"text": text, "label": category})
+        print(f"  page {page_num}: {len(results)} articles")
 
         next_page = payload.get("nextPage")
-        print(
-            f"  [{category}] page {page_num + 1}: {len(results)} articles "
-            f"(kept so far: {len(rows)})"
-        )
         if not next_page:
             break
-        time.sleep(sleep)
+        if page_num < pages:
+            time.sleep(sleep)
+
     return rows
 
 
+def write_csv(rows, out_path):
+    out_path = Path(out_path)
+    if out_path.parent and str(out_path.parent) not in ("", "."):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["text", "label"])
+        writer.writerows(rows)
+    return out_path
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--pages", type=int, default=3,
-        help="Pages to fetch per category (~10 articles/page on the free tier).",
+        "--pages",
+        type=int,
+        default=1,
+        help="Pages of results to request per category (default: 1).",
     )
-    parser.add_argument("--language", default="en", help="Language code (e.g. en).")
-    parser.add_argument("--country", default="", help="Optional country code filter.")
     parser.add_argument(
-        "--categories", nargs="*", default=CATEGORIES,
-        help="Categories to use as labels.",
+        "--language",
+        default="en",
+        help="NewsData.io language code (default: en).",
     )
-    parser.add_argument("--out", default="data/news_dataset.csv")
     parser.add_argument(
-        "--sleep", type=float, default=1.0,
-        help="Seconds to wait between requests (free-tier friendly).",
+        "--country",
+        default=None,
+        help=(
+            "Optional NewsData.io country filter, e.g. --country us. "
+            "Accepts a comma-separated list (--country us,gb) up to "
+            f"{MAX_COUNTRIES} codes. Omit for worldwide results."
+        ),
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        default=CATEGORIES,
+        choices=CATEGORIES,
+        metavar="CATEGORY",
+        help="Subset of categories to fetch (default: all free-tier categories).",
+    )
+    parser.add_argument(
+        "--titles-only",
+        action="store_true",
+        help="Use only the headline as the training text (skip the description).",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=1.0,
+        help="Seconds to wait between requests, to stay under free-tier limits.",
+    )
+    parser.add_argument(
+        "--out",
+        default="data/news_dataset.csv",
+        help="Output CSV path (default: data/news_dataset.csv).",
     )
     args = parser.parse_args()
 
+    if args.pages < 1:
+        sys.exit("ERROR: --pages must be at least 1.")
+
     api_key = get_api_key()
+    country = normalize_country(args.country)
+
+    scope = f"country={country}" if country else "worldwide"
+    print(
+        f"Fetching {args.pages} page(s) per category "
+        f"({len(args.categories)} categories, language={args.language}, {scope})\n"
+    )
+
     all_rows = []
     for category in args.categories:
-        print(f"Fetching '{category}' ...")
-        all_rows.extend(
-            fetch_category(
-                api_key, category, args.pages, args.language, args.country, args.sleep
-            )
+        print(f"[{category}]")
+        rows = fetch_category(
+            api_key,
+            category,
+            pages=args.pages,
+            language=args.language,
+            country=country,
+            include_description=not args.titles_only,
+            sleep=args.sleep,
+        )
+        print(f"  -> {len(rows)} usable rows")
+        all_rows.extend(rows)
+        time.sleep(args.sleep)
+
+    # Drop duplicate texts (the same story often appears in several pages).
+    seen = set()
+    deduped = []
+    for text, label in all_rows:
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((text, label))
+
+    if not deduped:
+        sys.exit(
+            "\nNo articles were collected. Check your API key, and if you used "
+            "--country try a broader value or drop the flag."
         )
 
-    # Deduplicate by text.
-    seen = set()
-    unique = []
-    for row in all_rows:
-        if row["text"] in seen:
-            continue
-        seen.add(row["text"])
-        unique.append(row)
+    out_path = write_csv(deduped, args.out)
 
-    if not unique:
-        sys.exit("No data collected. Try different categories or check your plan.")
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["text", "label"])
-        writer.writeheader()
-        writer.writerows(unique)
-
+    print(f"\nSaved {len(deduped)} rows to {out_path}")
     counts = {}
-    for row in unique:
-        counts[row["label"]] = counts.get(row["label"], 0) + 1
+    for _, label in deduped:
+        counts[label] = counts.get(label, 0) + 1
+    for label in sorted(counts):
+        print(f"  {label:<15} {counts[label]}")
 
-    print(f"\nWrote {len(unique)} examples to {out_path}")
-    for label, count in sorted(counts.items()):
-        print(f"  {label:<14} {count}")
+    thin = [label for label, n in counts.items() if n < 10]
+    if thin:
+        print(
+            "\nNote: few examples for " + ", ".join(sorted(thin)) +
+            ". Try a higher --pages, or a different/no --country."
+        )
 
 
 if __name__ == "__main__":
